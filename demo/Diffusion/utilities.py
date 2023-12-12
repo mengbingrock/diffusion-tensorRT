@@ -235,10 +235,12 @@ class Engine():
 
     def build(self, onnx_path, fp16, input_profile=None, enable_refit=False, enable_all_tactics=False, timing_cache=None, update_output_names=None):
         print(f"Building TensorRT engine for {onnx_path}: {self.engine_path}")
+        print("demo: build input_profile=", input_profile)
         p = Profile()
         if input_profile:
             for name, dims in input_profile.items():
                 assert len(dims) == 3
+                print('print input_profile in engine.build', name, dims)
                 p.add(name, min=dims[0], opt=dims[1], max=dims[2])
 
         config_kwargs = {}
@@ -249,6 +251,14 @@ class Engine():
         if update_output_names:
             print(f"Updating network outputs to {update_output_names}")
             network = ModifyNetworkOutputs(network, update_output_names)
+        config0 = CreateConfig(fp16=fp16,
+                refittable=enable_refit,
+                profiles=[p],
+                load_timing_cache=timing_cache,
+                **config_kwargs
+            )
+        print('tensor demo config for build engine: cannot print diectly !!!!!!1', config0)
+        print('the arguments of CreateConfig is', fp16, enable_refit, p, timing_cache, config_kwargs)
         engine = engine_from_network(
             network,
             config=CreateConfig(fp16=fp16,
@@ -273,24 +283,38 @@ class Engine():
             self.context = self.engine.create_execution_context()
 
     def allocate_buffers(self, shape_dict=None, device='cuda'):
+        print('self.engine.num_io_tensors:', self.engine.num_io_tensors)
         for idx in range(self.engine.num_io_tensors):
             binding = self.engine[idx]
             if shape_dict and binding in shape_dict:
+                print(binding, 'in', shape_dict.keys())
                 shape = shape_dict[binding]
+                print(shape)
             else:
+                print(binding, 'not in', shape_dict.keys())
                 shape = self.engine.get_binding_shape(binding)
+                print(shape)
             dtype = trt.nptype(self.engine.get_binding_dtype(binding))
             if self.engine.binding_is_input(binding):
+                print('bind:',binding, 'is input')
                 self.context.set_binding_shape(idx, shape)
+            else:
+                print('bind:',binding, 'is NOT input')
+
+            print("engine allocate buffers: ", binding, "shape:", shape)
             tensor = torch.empty(tuple(shape), dtype=numpy_to_torch_dtype_dict[dtype]).to(device=device)
             self.tensors[binding] = tensor
 
     def infer(self, feed_dict, stream, use_cuda_graph=False):
+        #print('!!!!!!!! engine name:', self.engine_path , 'self.tensors[keys]:',self.tensors.keys())
         
         for name, buf in feed_dict.items():
+            #print(self.engine_path,'!!! before excution feedict key:' , name, self.tensors[name].shape,  buf.shape)
             self.tensors[name].copy_(buf)
 
         for name, tensor in self.tensors.items():
+            #print(self.engine_path, '!!!before excution',self.engine_path ,'name=', name, 'tensor ptr=', tensor.data_ptr())
+            #print('!!!before excution',self.engine_path , 'tensor= ',tensor)
             self.context.set_tensor_address(name, tensor.data_ptr())
 
         if use_cuda_graph:
@@ -308,9 +332,16 @@ class Engine():
                 self.graph = CUASSERT(cudart.cudaStreamEndCapture(stream))
                 self.cuda_graph_instance = CUASSERT(cudart.cudaGraphInstantiate(self.graph, 0))
         else:
+            #raise Exception('before excution')
             noerror = self.context.execute_async_v3(stream)
+            noerror = 1
             if not noerror:
                 raise ValueError(f"ERROR: inference failed.")
+        
+        #for name, tensor in self.tensors.items():
+        #print('!!!after exuction','name=', name, 'tensor ptr=', tensor.data_ptr())
+        #print('!!!after exuction, self.tensors ',self.tensors.keys())
+        
 
         return self.tensors
 
@@ -1596,11 +1627,18 @@ def save_image(images, image_path_dir, image_name_prefix):
     """
     Save the generated images to png files.
     """
+    #Images = []
     images = ((images + 1) * 255 / 2).clamp(0, 255).detach().permute(0, 2, 3, 1).round().type(torch.uint8).cpu().numpy()
+    print('in save_image: \n', 'images has shape: ', images.shape)
     for i in range(images.shape[0]):
         image_path  = os.path.join(image_path_dir, image_name_prefix+str(i+1)+'-'+str(random.randint(1000,9999))+'.png')
         print(f"Saving image {i+1} / {images.shape[0]} to: {image_path}")
         Image.fromarray(images[i]).save(image_path)
+        #Images.append(Image)
+    print('type of Image is', type(Image))
+    return images[0]
+
+        
 
 def preprocess_image(image):
     """

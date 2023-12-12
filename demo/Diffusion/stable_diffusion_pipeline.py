@@ -19,6 +19,7 @@ import gc
 import os
 import pathlib
 import time
+import copy
 
 import numpy as np
 import nvtx
@@ -32,6 +33,8 @@ from models import (
     make_CLIPWithProj,
     make_tokenizer,
     make_UNet,
+    make_UNetC,
+    make_ControlNet,
     make_UNetXL,
     make_VAE,
     make_VAEEncoder
@@ -76,6 +79,8 @@ class StableDiffusionPipeline:
         lora_weights=None,
         return_latents=False,
         torch_inference='',
+        # use fused cnet + unet, default for HF
+        use_fused_unet_cnet=0
     ):
         """
         Initializes the Diffusion pipeline.
@@ -140,6 +145,7 @@ class StableDiffusionPipeline:
 
         self.version = version
         self.controlnet = controlnet
+        self.use_fused_unet_cnet = use_fused_unet_cnet
 
         # Schedule options
         sched_opts = {'num_train_timesteps': 1000, 'beta_start': 0.00085, 'beta_end': 0.012}
@@ -168,8 +174,15 @@ class StableDiffusionPipeline:
             raise ValueError(f"Unsupported scheduler {scheduler}. Should be either DDIM, DPM, EulerA, LMSD, PNDM, or UniPCMultistepScheduler.")
 
         self.pipeline_type = pipeline_type
-        if self.pipeline_type.is_txt2img() or self.pipeline_type.is_controlnet():
-            self.stages = ['clip','unet','vae']
+        if self.pipeline_type.is_txt2img():
+            self.stages = ['clip','unet', 'vae']
+
+        elif self.pipeline_type.is_controlnet():
+            if use_fused_unet_cnet:
+                self.stages = ['clip','unet', 'vae']
+            else:
+                self.stages = ['clip','unet-c' ,'controlnet', 'vae']
+
         elif self.pipeline_type.is_img2img() or self.pipeline_type.is_inpaint():
             self.stages = ['vae_encoder', 'clip','unet','vae']
         elif self.pipeline_type.is_sd_xl_base():
@@ -220,9 +233,11 @@ class StableDiffusionPipeline:
             return
 
         # Allocate buffers for TensorRT engine bindings
+        print('[I]  Allocate buffers for TensorRT engine bindings')
         for model_name, obj in self.models.items():
             if model_name == 'vae' and self.config.get('vae_torch_fallback', False):
                 continue
+            print(model_name, obj.get_shape_dict(batch_size, image_height, image_width))
             self.engine[model_name].allocate_buffers(shape_dict=obj.get_shape_dict(batch_size, image_height, image_width), device=self.device)
 
     def teardown(self):
@@ -335,9 +350,24 @@ class StableDiffusionPipeline:
         if 'unet' in self.stages:
             models_args['lora_scale'] = self.lora_scale
             models_args['lora_weights'] = self.lora_weights
+            print('[I] !!!!!!!!!!!1 demo make_Unet params=\n', models_args, '\n self.controlnet = \n', self.controlnet)
             self.models['unet'] = make_UNet(controlnet=self.controlnet, **models_args)
             models_args.pop('lora_scale')
             models_args.pop('lora_weights')
+        
+        if 'unet-c' in self.stages:
+            print('!!!! make_UNetC called , with controlnet inputs support')
+            self.models['unet-c'] = make_UNetC(controlnet=self.controlnet, **models_args)
+
+        if 'controlnet' in self.stages:
+            print('[I] calling make_controlnet!!!!!!')
+            
+            # build the controlnet for each controlnet type passed
+            for name in self.controlnet:
+                print('calling make_controlnet: calling controlnet name(not list)=', name)
+                self.models[name.split('/')[-1]] = make_ControlNet(controlnet=name, **models_args)
+
+
         if 'unetxl' in self.stages:
             models_args['lora_scale'] = self.lora_scale
             models_args['lora_weights'] = self.lora_weights
@@ -391,10 +421,18 @@ class StableDiffusionPipeline:
                 onnx_opt_path = self.getOnnxPath(model_name, onnx_dir)
                 if force_export or not os.path.exists(onnx_opt_path):
                     if force_export or not os.path.exists(onnx_path):
-                        print(f"Exporting model: {onnx_path}")
+                        print(f"Exporting model: {onnx_path} from folder {framework_model_dir}")
                         model = obj.get_model(framework_model_dir)
                         with torch.inference_mode(), torch.autocast("cuda"):
-                            inputs = obj.get_sample_input(1, opt_image_height, opt_image_width)
+                            inputs = obj.get_sample_input(opt_batch_size, opt_image_height, opt_image_width)
+                            print('!!!!!!!!!!!!!!!!!!!!!!!!demo onnx export, model name:',model_name,\
+                                    #'inputs=', [ins.shape if len(ins) > 0 else ins for ins in inputs], 
+                                    'onnx_path:', onnx_path,\
+                                    'onnx_opset:',onnx_opset,\
+                                    'dynamic_axes:',obj.get_dynamic_axes(),\
+                                    'input_names:', obj.get_input_names(), \
+                                    'output_names:', obj.get_output_names()
+                                    )
                             torch.onnx.export(model,
                                     inputs,
                                     onnx_path,
@@ -426,7 +464,9 @@ class StableDiffusionPipeline:
                             onnx.save(onnx_opt_graph, onnx_opt_path)
                     else:
                         print(f"Found cached optimized model: {onnx_opt_path} ")
-
+                    print('finished building onnx: ',model_name )
+                    
+        
         # Build TensorRT engines
         for model_name, obj in self.models.items():
             if model_name == 'vae' and self.config.get('vae_torch_fallback', False):
@@ -439,6 +479,18 @@ class StableDiffusionPipeline:
 
             if force_build or not os.path.exists(engine.engine_path):
                 update_output_names = obj.get_output_names() + obj.extra_output_names if obj.extra_output_names else None
+                print(f'model name = {model_name}')
+                '''
+                if model_name == 'unet':
+                    print(model_name,'unet update_output_names=',update_output_names)
+                    print(opt_batch_size, opt_image_height, opt_image_width,"static_bacht=",static_batch, "static_shape=",static_shape)
+                    print(model_name, '!!!!!!!demo engine.build input_profile= ')
+                    print(obj.get_input_profile(opt_batch_size, opt_image_height, opt_image_width,static_batch=static_batch, static_shape=static_shape))
+                    
+                    print(model_name, '!!!!!! demo enable refit, enable_all_tactics, timing_cache, update_output_names=', enable_refit, \
+                            enable_all_tactics, timing_cache, update_output_names)
+                '''
+                
                 engine.build(onnx_opt_path,
                     fp16=True,
                     input_profile=obj.get_input_profile(
@@ -450,6 +502,7 @@ class StableDiffusionPipeline:
                     timing_cache=timing_cache,
                     update_output_names=update_output_names)
             self.engine[model_name] = engine
+            print('finished building engine: ',model_name )
 
         # Load TensorRT engines
         for model_name, obj in self.models.items():
@@ -543,6 +596,7 @@ class StableDiffusionPipeline:
         tokenizer = self.tokenizer2 if encoder == 'clip2' else self.tokenizer
 
         def tokenize(prompt):
+            print('tokenizer.model_max_length:', tokenizer.model_max_length)
             text_input_ids = tokenizer(
                 prompt,
                 padding="max_length",
@@ -598,7 +652,9 @@ class StableDiffusionPipeline:
         controlnet_imgs=None,
         controlnet_scales=None,
         text_embeds=None,
-        time_ids=None):
+        time_ids=None,
+        use_fused_unet_cnet = False
+        ):
 
         assert guidance > 1.0, "Guidance has to be > 1.0"
         assert image_guidance > 1.0, "Image guidance has to be > 1.0"
@@ -627,7 +683,8 @@ class StableDiffusionPipeline:
                 if text_embeds != None or time_ids != None:
                     params.update({'added_cond_kwargs': added_cond_kwargs})
                 noise_pred = self.torch_models[denoiser](**params)["sample"]
-            else:
+            # use fused controlnet + unet, default for demo
+            elif use_fused_unet_cnet:
                 timestep_float = timestep.float() if timestep.dtype != torch.float32 else timestep
 
                 params = {"sample": latent_model_input, "timestep": timestep_float, "encoder_hidden_states": text_embeddings}
@@ -638,10 +695,57 @@ class StableDiffusionPipeline:
                 if time_ids != None:
                     params.update({'time_ids': time_ids})
                 noise_pred = self.runEngine(denoiser, params)['latent']
+                
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                
+                noise_pred = noise_pred_uncond + guidance * (noise_pred_text - noise_pred_uncond)
 
-            # Perform guidance
-            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-            noise_pred = noise_pred_uncond + guidance * (noise_pred_text - noise_pred_uncond)
+            # use cnet and unet separately
+            elif not use_fused_unet_cnet:
+                timestep_float = timestep.float() if timestep.dtype != torch.float32 else timestep
+                params = {"sample": latent_model_input, "timestep": timestep_float, "encoder_hidden_states": text_embeddings}
+
+                # need to loop through all controlnets
+                count = 0
+                for img, scale, model_name in zip(controlnet_imgs, controlnet_scales, self.controlnet):
+                    if controlnet_imgs is not None:
+                        params.update({"controlnet_cond": img})
+                        # change 1.0 later, done
+                        params.update({"conditioning_scale": scale})
+                    
+
+                    if text_embeds != None:
+                        params.update({'text_embeds': text_embeds})
+                    if time_ids != None:
+                        params.update({'time_ids': time_ids})
+
+
+                    model_name = model_name.split('/')[-1]
+                    ret_cnet = self.runEngine(model_name, params)
+
+                    if count == 0:
+                        ret_cnet_res = copy.deepcopy(ret_cnet)
+                    else:
+                        for k in ret_cnet_res.keys():
+                            ret_cnet_res[k] += ret_cnet[k]
+                    count += 1
+                
+
+                # delete the image params that the unet do not use
+                del params['controlnet_cond']
+                del params['conditioning_scale']
+
+                for k,v in ret_cnet.items():
+                    if k in self.models['unet-c'].get_input_names():
+                        params[k] = v
+
+            
+                
+                noise_pred = self.runEngine('unet-c', params)['latent']
+
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                
+                noise_pred = noise_pred_uncond + guidance * (noise_pred_text - noise_pred_uncond)
 
             if type(self.scheduler) == UniPCMultistepScheduler:
                 latents = self.scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
@@ -710,6 +814,7 @@ class StableDiffusionPipeline:
         warmup=False,
         verbose=False,
         save_image=True,
+        use_fused_unet_cnet=False
     ):
         """
         Run the diffusion pipeline.
@@ -826,9 +931,14 @@ class StableDiffusionPipeline:
                 denoise_kwargs.update({'text_embeds': pooled_embeddings2, 'time_ids': add_time_ids})
             else:
                 text_embeddings = self.encode_prompt(prompt, negative_prompt)
+            print("!!! len of text_embeddings:", text_embeddings.shape)
 
             # UNet denoiser + (optional) ControlNet(s)
             denoiser = 'unetxl' if self.pipeline_type.is_sd_xl() else 'unet'
+
+            # add the config for whether use the fused unet + cnet
+            denoise_kwargs.update({'use_fused_unet_cnet': use_fused_unet_cnet})
+            
             latents = self.denoise_latent(latents, text_embeddings, denoiser=denoiser, guidance=self.guidance_scale, **denoise_kwargs)
 
         with torch.inference_mode(), trt.Runtime(TRT_LOGGER):
@@ -845,7 +955,10 @@ class StableDiffusionPipeline:
         if not warmup:
             self.print_summary(self.denoising_steps, walltime_ms, batch_size)
             if not self.return_latents and save_image:
+                print('save image images.shape:', images.shape)
                 self.save_image(images, self.pipeline_type.name.lower(), prompt)
+
+        print('return latent is', self.return_latents)
 
         return (latents, walltime_ms) if self.return_latents else (images, walltime_ms)
 
@@ -861,17 +974,25 @@ class StableDiffusionPipeline:
             negative_prompt = negative_prompt * batch_size
 
         num_warmup_runs = max(1, num_warmup_runs) if use_cuda_graph else num_warmup_runs
+
+        print('set warm up runs to 0')
+        num_warmup_runs = 0
         if num_warmup_runs > 0:
-            print("[I] Warming up ..")
+            print("[I] Warming up ..", num_warmup_runs)
             for _ in range(num_warmup_runs):
                 self.infer(prompt, negative_prompt, height, width, warmup=True, **kwargs)
 
+        
         for _ in range(batch_count):
             print("[I] Running StableDiffusion pipeline")
             if self.nvtx_profile:
                 cudart.cudaProfilerStart()
-            self.infer(prompt, negative_prompt, height, width, warmup=False, **kwargs)
+            img, walltime = self.infer(prompt, negative_prompt, height, width, warmup=False, **kwargs)
+            
             if self.nvtx_profile:
                 cudart.cudaProfilerStop()
+        
+        print('demo return call save_image\n img has shape:', img.shape)
+        return save_image(img,'.','test_img_')
 
 

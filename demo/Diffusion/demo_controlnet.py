@@ -30,6 +30,7 @@ def parseArgs():
     parser = add_arguments(parser)
     parser.add_argument('--scheduler', type=str, default="UniPCMultistepScheduler", choices=["DDIM", "DPM", "EulerA", "LMSD", "PNDM", "UniPCMultistepScheduler"], help="Scheduler for diffusion process")
     parser.add_argument('--input-image', nargs = '+', type=str, default=[], help="Path to the input image/images already prepared for ControlNet modality. For example: canny edged image for canny ControlNet, not just regular rgb image")
+    parser.add_argument('--input-image-preprocess', nargs = '+', type=str, default=[], help="prepocess type for --input_image, if NOT already prepared for ControlNet modality")
     parser.add_argument('--controlnet-type', nargs='+', type=str, default=["canny"], help="Controlnet type, can be `None`, `str` or `str` list from ['canny', 'depth', 'hed', 'mlsd', 'normal', 'openpose', 'scribble', 'seg']")
     parser.add_argument('--controlnet-scale', nargs='+', type=float, default=[1.0], help="The outputs of the controlnet are multiplied by `controlnet_scale` before they are added to the residual in the original unet, can be `None`, `float` or `float` list")
     return parser.parse_args()
@@ -55,9 +56,18 @@ if __name__ == "__main__":
 
     # Check images
     input_images = []
+    
+    
     if len(args.input_image) > 0:
-        for image in args.input_image:
-            input_images.append(Image.open(image))
+        for idx, image in enumerate(args.input_image):
+            preprocess = args.input_image_preprocess[idx]
+            #  todo: multiple if, canny, depth, hed, etc
+            if preprocess == "canny":
+                print('preprocess = canny for image idx=', idx)
+                input_images.append(controlnet_aux.CannyDetector()(Image.open(image)))
+            else:
+                print('no preprocess for image idx=', idx)
+                input_images.append(Image.open(image))
     else:
         for controlnet in args.controlnet_type:
             if controlnet == "canny":
@@ -118,6 +128,6 @@ if __name__ == "__main__":
 
     # Run inference
     demo_kwargs = {'input_image': input_images, 'controlnet_scales': controlnet_scale}
-    demo.run(*args_run_demo, **demo_kwargs)
+    imgresult = demo.run(*args_run_demo, **demo_kwargs)
 
     demo.teardown()

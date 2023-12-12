@@ -105,7 +105,7 @@ class Optimizer():
         if return_onnx:
             return onnx_graph
 
-def get_controlnets_path(controlnet_list):
+def get_controlnets_path(controlnet_list, local = False):
     '''
     Currently ControlNet 1.0 is supported.
     '''
@@ -259,6 +259,7 @@ class BaseModel():
     ):
 
         self.name = self.__class__.__name__
+        print('!!!!!debug pipeline = ', pipeline)
         self.pipeline = pipeline.name
         self.version = version
         self.hf_token = hf_token
@@ -477,6 +478,9 @@ class UNet2DConditionControlNetModel(torch.nn.Module):
         
     def forward(self, sample, timestep, encoder_hidden_states, images, controlnet_scales):
         for i, (image, conditioning_scale, controlnet) in enumerate(zip(images, controlnet_scales, self.controlnets)):
+            print('!!!!! controlnet inputs names:  sample, timestep, encoder_hidder_states, image \n')
+            print('!!! their dimensions:',sample.shape, timestep.shape, encoder_hidden_states.shape, image.shape)
+            #print('!!!! unet dim=', self.unet.unet_dim)
             down_samples, mid_sample = controlnet(
                 sample,
                 timestep,
@@ -509,6 +513,454 @@ class UNet2DConditionControlNetModel(torch.nn.Module):
             mid_block_additional_residual=mid_block_res_sample
         )
         return noise_pred
+
+class ControlNet(BaseModel):
+    def __init__(self, 
+        version,
+        pipeline,
+        hf_token,
+        device='cuda',
+        verbose=True,
+        fp16=False,
+        max_batch_size=16,
+        text_maxlen=77,
+        unet_dim=4,
+        controlnet='Depth',
+        lora_weights=None,
+        lora_scale=1,
+        local = False
+    ):
+        super().__init__(version, pipeline, hf_token, fp16=fp16, device=device, verbose=verbose, max_batch_size=max_batch_size, text_maxlen=text_maxlen, embedding_dim=get_unet_embedding_dim(version, pipeline))
+        self.subfolder = 'controlnet'
+        self.unet_dim = unet_dim
+        self.device = device
+        self.text_maxlen = text_maxlen
+        self.embedding_dim = 768
+        self.model = None
+        self.type = controlnet
+
+
+    def get_model(self, framework_model_dir, torch_inference=''):
+        model_opts = {'variant': 'fp16', 'torch_dtype': torch.float16} if self.fp16 else {}
+
+        cnet_model_opts = {'torch_dtype': torch.float16} if self.fp16 else {}
+        # fix the depth in for development
+        print('!!!self.type=', self.type)
+        
+        if self.type == 'depth':
+            model = ControlNetModel.from_pretrained('lllyasviel/sd-controlnet-depth', **cnet_model_opts).to(self.device)
+        elif self.type == 'canny':
+            model = ControlNetModel.from_pretrained('lllyasviel/control_v11p_sd15_canny', **cnet_model_opts).to(self.device)
+        elif self.type == 'openpose':
+            model = ControlNetModel.from_pretrained('lllyasviel/control_v11p_sd15_openpose', **cnet_model_opts).to(self.device)
+        # local path, e.g. '/localdisk/wangmengbing/epoch-000090.ckpt'
+        else:
+            model = ControlNetModel.from_single_file(self.type, dtype=torch.float16).to(self.device)
+            
+        # Use default attention processor for ONNX export
+        if not torch_inference:
+            model.set_default_attn_processor()
+
+        model = optimize_checkpoint(model, torch_inference)
+        self.model = model
+        return model
+
+    def get_input_names(self):
+        return ['sample', 'timestep', 'encoder_hidden_states', 'controlnet_cond', "conditioning_scale"]
+
+
+    def get_input_profile(self, batch_size, image_height, image_width, static_batch, static_shape):
+        latent_height, latent_width = self.check_dims(batch_size, image_height, image_width)
+        min_batch, max_batch, min_image_height, max_image_height, min_image_width, max_image_width, min_latent_height, max_latent_height, min_latent_width, max_latent_width = \
+            self.get_minmax_dims(batch_size, image_height, image_width, static_batch, static_shape)
+        return {
+            'sample': [(2*min_batch, self.unet_dim, min_latent_height, min_latent_width), 
+                       (2*batch_size, self.unet_dim, latent_height, latent_width), 
+                       (2*max_batch, self.unet_dim, max_latent_height, max_latent_width)],
+            'encoder_hidden_states': [(2*min_batch, self.text_maxlen, self.embedding_dim), 
+                                      (2*batch_size, self.text_maxlen, self.embedding_dim), 
+                                      (2*max_batch, self.text_maxlen, self.embedding_dim)],
+            "controlnet_cond": [(2*min_batch, 3, min_image_height, min_image_width), 
+                      (2*batch_size, 3, image_height, image_width), 
+                      (2*max_batch, 3, max_image_height, max_image_width)]
+        }
+
+
+    def get_sample_input(self, batch_size, image_height, image_width):
+        latent_height, latent_width = self.check_dims(batch_size, image_height, image_width)
+        dtype = torch.float16 if self.fp16 else torch.float32
+        return (
+            # sample
+            torch.randn(2*batch_size, self.unet_dim, latent_height, latent_width, dtype=torch.float32, device=self.device),
+            # timestep
+            torch.tensor(1.0, dtype=torch.float32, device=self.device),
+            # encoder_hidden_states
+            torch.randn(2*batch_size, 77, 768, dtype=dtype, device=self.device),
+            # "controlnet_cond"
+            torch.randn(2*batch_size, 3, image_height, image_width, dtype=dtype, device=self.device),
+            # "conditioning_scale"
+            torch.tensor(1.0, dtype=dtype, device=self.device)
+        )
+
+    def get_shape_dict(self, batch_size, image_height, image_width):
+        latent_height, latent_width = self.check_dims(batch_size, image_height, image_width)
+        if not self.model: self.get_model('engine-cnet-depth')
+        block_out_channels = self.model.config.block_out_channels
+        n_downsamples = len(block_out_channels) - 1
+        shape_dict = {
+            'sample': (2*batch_size, self.unet_dim, latent_height, latent_width),
+            'encoder_hidden_states': (2*batch_size, self.text_maxlen, self.embedding_dim),
+            "controlnet_cond": (2*batch_size, 3, image_height, image_width),
+            #'latent': (2*batch_size, 4, latent_height, latent_width)
+            }
+        shape_dict["down_block_res_samples.0"] = (2*batch_size, block_out_channels[0], latent_height, latent_width)
+
+        counter = 1
+        for i in range(len(block_out_channels)):
+            for _ in range(self.model.config.layers_per_block):
+                shape_dict[f"down_block_res_samples.{counter}"] = \
+                    (2*batch_size,  block_out_channels[i], latent_height // 2**i, latent_width// 2**i)
+                counter += 1
+
+            if i != len(block_out_channels) - 1:
+                shape_dict[f"down_block_res_samples.{counter}"] = \
+                    (2*batch_size, block_out_channels[i], latent_height // 2**(i+1), latent_width// 2**(i+1))
+                counter += 1
+
+        shape_dict['mid_block_res_sample'] = \
+            (2*batch_size, block_out_channels[-1], latent_height // 2**n_downsamples, latent_width // 2**n_downsamples)
+
+        return shape_dict
+
+    def get_output_names(self):
+        block_out_channels = self.model.config.block_out_channels
+        n_downsamples = len(block_out_channels) - 1
+        outputs = ["down_block_res_samples.0"]
+        counter = 1
+        for i in range(len(self.model.config.block_out_channels)):
+            for _ in range(self.model.config.layers_per_block):
+                outputs.append(f"down_block_res_samples.{counter}")
+                counter += 1
+            if i != len(self.model.config.block_out_channels) - 1:
+                # downsample
+                outputs.append(f"down_block_res_samples.{counter}")
+                counter += 1
+
+        outputs.append("mid_block_res_sample")
+
+        return outputs
+
+    def get_dynamic_axes(self):
+        axis_dynamic = {
+        'sample': {0: '2B', 2: 'H', 3: 'W'},
+        'encoder_hidden_states': {0: '2B'},
+        "controlnet_cond": {0: '2B', 2: '8H', 3: '8W'},
+        }
+    
+        block_out_channels = self.model.config.block_out_channels
+        n_downsamples = len(block_out_channels) - 1
+
+        axis_dynamic["down_block_res_samples.0"] = {
+            0: "2B",
+            2: "H",
+            3: "W",
+        }
+
+
+        counter = 1
+        for i in range(len(self.model.config.block_out_channels)):
+            for _ in range(self.model.config.layers_per_block):
+                axis_dynamic[f"down_block_res_samples.{counter}"] = {
+                    0: "2B",
+                    2: f"H // {2**i}",
+                    3: f"W // {2**i}",
+                }
+                counter += 1
+            if i != len(self.model.config.block_out_channels) - 1:
+                # downsample
+                axis_dynamic[f"down_block_res_samples.{counter}"] = {
+                    0: "2B",
+                    2: f"H // {2**(i + 1)}",
+                    3: f"W // {2**(i + 1)}",
+                }
+                counter += 1
+
+        axis_dynamic["mid_block_res_sample"] = {
+            0: "2B",
+            2: f"H // {2**n_downsamples}",
+            3: f"W // {2**n_downsamples}",
+        }
+        return axis_dynamic
+
+def make_ControlNet(version, pipeline, hf_token, device, verbose, max_batch_size, controlnet=None, lora_weights=None, lora_scale=1):
+    return ControlNet(version, pipeline, hf_token, fp16=True, device=device, verbose=verbose,
+            max_batch_size=max_batch_size, unet_dim=(9 if pipeline.is_inpaint() else 4),
+            #controlnet=get_controlnets_path(controlnet)
+            controlnet = controlnet
+            )
+
+# the temp unet model with controlnet input enabled
+class UNetC(BaseModel):
+    def __init__(self,
+        version,
+        pipeline,
+        hf_token,
+        device='cuda',
+        verbose=True,
+        fp16=False,
+        max_batch_size=16,
+        text_maxlen=77,
+        unet_dim=4,
+        controlnet=None,
+        lora_weights=None,
+        lora_scale=1,
+    ):
+
+        super(UNetC, self).__init__(version, pipeline, hf_token, fp16=fp16, device=device, verbose=verbose, max_batch_size=max_batch_size, text_maxlen=text_maxlen, embedding_dim=get_unet_embedding_dim(version, pipeline))
+        self.subfolder = 'unet'
+        self.unet_dim = unet_dim
+        
+        self.lora_weights=lora_weights
+        self.lora_scale=lora_scale
+        self.config = None
+
+    def get_model(self, framework_model_dir, torch_inference=''):
+        model_opts = {'variant': 'fp16', 'torch_dtype': torch.float16} if self.fp16 else {}
+        
+        
+        unet_model = UNet2DConditionModel.from_pretrained(self.path,
+            subfolder=self.subfolder,
+            use_safetensors=self.hf_safetensor,
+            use_auth_token=self.hf_token,
+            **model_opts).to(self.device)
+        print('load model from', self.path + self.subfolder)
+        # Use default attention processor for ONNX export
+        if not torch_inference:
+            unet_model.set_default_attn_processor()
+        fuse_lora_weights(unet_model, self.lora_weights, self.lora_scale)
+        unet_model_dir = get_checkpoint_dir(framework_model_dir, self.version, self.pipeline, self.subfolder, torch_inference)
+        print('unet_model_dir:', unet_model_dir)
+        if not os.path.exists(unet_model_dir):
+            model = UNet2DConditionModel.from_pretrained(self.path,
+                subfolder=self.subfolder,
+                use_safetensors=self.hf_safetensor,
+                use_auth_token=self.hf_token,
+                **model_opts).to(self.device)
+            model.save_pretrained(unet_model_dir)
+        else:
+            print(f"[I] Load UNet pytorch model from: {unet_model_dir}")
+            model = UNet2DConditionModel.from_pretrained(unet_model_dir).to(self.device)
+        if torch_inference:
+            model.to(memory_format=torch.channels_last)
+        fuse_lora_weights(model, self.lora_weights, self.lora_scale)
+        model = optimize_checkpoint(model, torch_inference)
+        self.config = model.config
+        return model
+
+    def get_input_names(self):
+       
+        inputs_name = ['sample', 'timestep', 'encoder_hidden_states']
+
+
+        # downblocks
+        block_out_channels = self.config.block_out_channels
+        n_downsamples = len(block_out_channels) - 1
+        inputs_name += ['down_block_res_samples.0']
+        counter = 1
+        for i in range(len(self.config.block_out_channels)):
+            for _ in range(self.config.layers_per_block):
+                inputs_name.append(f"down_block_res_samples.{counter}")
+                counter += 1
+            if i != len(self.config.block_out_channels) - 1:
+                # downsample
+                inputs_name.append(f"down_block_res_samples.{counter}")
+                counter += 1
+
+
+        #midblocks
+        inputs_name.append("mid_block_res_sample")
+        #inputs_name.append('mid_block_additional_residual')
+        return inputs_name
+        #return ['sample', 'timestep', 'encoder_hidden_states', 'mid_block_additional_residual']
+       
+
+    def get_output_names(self):
+        return ['latent']
+
+    def get_dynamic_axes(self):
+        
+        block_out_channels = self.config.block_out_channels
+        n_downsamples = len(block_out_channels) - 1
+
+        axis_dynamic = {
+            'sample': {0: '2B', 2: 'H', 3: 'W'},
+            'encoder_hidden_states': {0: '2B'},
+            'latent': {0: '2B', 2: 'H', 3: 'W'}
+        }
+
+
+        # downblocks
+        axis_dynamic["down_block_res_samples.0"] = {
+            0: "2B",
+            2: "H",
+            3: "W",
+        }
+
+
+        counter = 1
+        for i in range(len(self.config.block_out_channels)):
+            for _ in range(self.config.layers_per_block):
+                axis_dynamic[f"down_block_res_samples.{counter}"] = {
+                    0: "2B",
+                    2: f"H // {2**i}",
+                    3: f"W // {2**i}",
+                }
+                counter += 1
+            if i != len(self.config.block_out_channels) - 1:
+                # downsample
+                axis_dynamic[f"down_block_res_samples.{counter}"] = {
+                    0: "2B",
+                    2: f"H // {2**(i + 1)}",
+                    3: f"W // {2**(i + 1)}",
+                }
+                counter += 1
+
+        # midblocks
+        axis_dynamic["mid_block_res_sample"] = {
+            0: "2B",
+            2: f"H // {2**n_downsamples}",
+            3: f"W // {2**n_downsamples}",
+        }
+
+        return axis_dynamic
+
+            
+
+
+    def get_input_profile(self, batch_size, image_height, image_width, static_batch, static_shape):
+        latent_height, latent_width = self.check_dims(batch_size, image_height, image_width)
+        min_batch, max_batch, min_image_height, max_image_height, min_image_width, max_image_width, min_latent_height, max_latent_height, min_latent_width, max_latent_width = \
+            self.get_minmax_dims(batch_size, image_height, image_width, static_batch, static_shape)
+        if not self.config: self.get_model(self.path + self.subfolder)
+        
+        block_out_channels = self.config.block_out_channels
+        n_downsamples = len(block_out_channels) - 1
+        
+        '''
+        'mid_block_additional_residual':
+            torch.randn(batch_size, 1280, (latent_height + 2**n_downsamples - 1)//2**n_downsamples,
+            (latent_width + 2**n_downsamples - 1)//2**n_downsamples, dtype=dtype, device=self.device)
+        '''
+
+        
+        shapes = {
+            'sample': 
+                        [(2*min_batch, self.unet_dim, min_latent_height, min_latent_width),
+                        (2*batch_size, self.unet_dim, latent_height, latent_width),
+                        (2*max_batch, self.unet_dim, max_latent_height, max_latent_width)],
+            'encoder_hidden_states': [(2*min_batch, self.text_maxlen, self.embedding_dim),
+                                        (2*batch_size, self.text_maxlen, self.embedding_dim),
+                                        (2*max_batch, self.text_maxlen, self.embedding_dim)],
+            
+            'mid_block_res_sample': [(2*min_batch, 1280, (min_latent_height + 2**n_downsamples - 1)//2**n_downsamples, (min_latent_width + 2**n_downsamples - 1)//2**n_downsamples),
+                                        (2*batch_size, 1280, (latent_height + 2**n_downsamples - 1)//2**n_downsamples, (latent_width + 2**n_downsamples - 1)//2**n_downsamples),
+                                        (2*batch_size, 1280, (max_latent_height + 2**n_downsamples - 1)//2**n_downsamples, (max_latent_width + 2**n_downsamples - 1)//2**n_downsamples)],
+            'down_block_res_samples.0': [
+                                        (2*min_batch, block_out_channels[0], min_latent_height, min_latent_width),
+                                        (2*batch_size, block_out_channels[0], latent_height, latent_width),
+                                        (2*max_batch, block_out_channels[0], max_latent_height, max_latent_width)
+                                        ]
+        }
+
+        counter = 1
+        for i in range(len(self.config.block_out_channels)):
+            for _ in range(self.config.layers_per_block):
+                shapes[f"down_block_res_samples.{counter}"] = [
+                    (2*min_batch, block_out_channels[i], (min_latent_height + 2**i -1) // 2**i, (min_latent_width + 2**i -1)// 2**i),
+                    (2*batch_size, block_out_channels[i], (latent_height + 2**i -1)// 2**i, (latent_width + 2**i -1) // 2**i),
+                    # (latent_height + 2**i -1)// 2**i, (latent_width + 2**i -1)// 2**i
+                    (2*max_batch, block_out_channels[i], (max_latent_height + 2**i -1) // 2**i, (max_latent_width + 2**i -1) // 2**i)
+                    ]
+                counter += 1
+            if i != len(self.config.block_out_channels) - 1:
+                shapes[f"down_block_res_samples.{counter}"] = [
+                    (2*min_batch, block_out_channels[i], (min_latent_height + 2**(i+1) -1)// 2**(i+1), (min_latent_width + 2**(i+1) -1) // 2**(i+1)),
+                    (2*batch_size, block_out_channels[i], (latent_height + 2**(i+1) -1)// 2**(i+1), (latent_width + 2**(i+1) -1) // 2**(i+1)),
+                    (2*max_batch, block_out_channels[i], (max_latent_height + 2**(i+1) -1 )// 2**(i+1), (max_latent_width + 2**(i+1) -1)// 2**(i+1))
+                ]
+                counter += 1
+
+        
+        return shapes
+        
+
+
+    def get_shape_dict(self, batch_size, image_height, image_width):
+        latent_height, latent_width = self.check_dims(batch_size, image_height, image_width)
+        if not self.config: self.get_model(self.path + self.subfolder)
+
+        
+        block_out_channels = self.config.block_out_channels
+        n_downsamples = len(block_out_channels) - 1
+        shape_dict = {
+            'sample': (2*batch_size, self.unet_dim, latent_height, latent_width),
+            'encoder_hidden_states': (2*batch_size, self.text_maxlen, self.embedding_dim),
+            'mid_block_res_sample': (2*batch_size, 1280, (latent_height + 2**n_downsamples - 1)//2**n_downsamples, (latent_width + 2**n_downsamples - 1)//2**n_downsamples)
+        }
+
+        shape_dict['down_block_res_samples.0'] = (2*batch_size, block_out_channels[0], latent_height, latent_width)
+        
+        counter = 1
+        for i in range(len(block_out_channels)):
+            for _ in range(self.config.layers_per_block):
+                shape_dict[f"down_block_res_samples.{counter}"] = (2*batch_size, block_out_channels[i], (latent_height + 2**i -1) // 2**i, (latent_width + 2**i -1) // 2**i)
+                counter += 1
+            if i != len(self.config.block_out_channels) - 1:
+                shape_dict[f"down_block_res_samples.{counter}"] = (2*batch_size, block_out_channels[i], (latent_height + 2**(i+1) -1 ) // 2**(i+1), (latent_width  + 2**(i+1) -1 ) // 2**(i+1))
+                counter += 1
+
+        #raise Exception('check shapedict')
+        shape_dict['latent'] = (2*batch_size, 4, latent_height, latent_width)
+        return shape_dict
+
+
+
+    def get_sample_input(self, batch_size, image_height, image_width):
+        latent_height, latent_width = self.check_dims(batch_size, image_height, image_width)
+        dtype = torch.float16 if self.fp16 else torch.float32
+        if not self.config: self.get_model(self.self.path + self.subfolder)
+        
+        block_out_channels = self.config.block_out_channels
+        n_downsamples = len(block_out_channels) - 1
+        # downblocks
+        downblocks = (torch.randn(batch_size, block_out_channels[0], latent_height, latent_width, dtype=dtype, device=self.device),)
+       
+        for i in range(len(block_out_channels)):
+            for _ in range(self.config.layers_per_block):
+                downblocks += (torch.randn(batch_size, block_out_channels[i], (latent_height + 2**i -1)// 2**i, (latent_width + 2**i -1)// 2**i, dtype=dtype, device=self.device),)
+            if i != len(self.config.block_out_channels) - 1:
+                downblocks += (torch.randn(batch_size, block_out_channels[i], (latent_height + 2**(i+1) -1 )// 2**(i+1), (latent_width  + 2**(i+1) -1 )// 2**(i+1), dtype=dtype, device=self.device),)
+        
+        return (
+            torch.randn(batch_size, self.unet_dim, latent_height, latent_width, dtype=torch.float32, device=self.device),
+            torch.tensor([1.], dtype=torch.float32, device=self.device),
+            torch.randn(batch_size, self.text_maxlen, self.embedding_dim, dtype=dtype, device=self.device),
+            # mid_block res
+            {   
+                'down_block_additional_residuals': downblocks,
+                'mid_block_additional_residual':
+                    torch.randn(batch_size, 1280, (latent_height + 2**n_downsamples - 1)//2**n_downsamples,
+                                                    (latent_width + 2**n_downsamples - 1)//2**n_downsamples, dtype=dtype, device=self.device)
+            }
+        )
+        
+
+def make_UNetC(version, pipeline, hf_token, device, verbose, max_batch_size, controlnet=None, lora_weights=None, lora_scale=1):
+    return UNetC(version, pipeline, hf_token, fp16=True, device=device, verbose=verbose,
+            max_batch_size=max_batch_size, unet_dim=(9 if pipeline.is_inpaint() else 4),
+            controlnet=get_controlnets_path(controlnet), lora_weights=lora_weights,
+            lora_scale=lora_scale)
+
 
 class UNet(BaseModel):
     def __init__(self,
@@ -547,7 +999,17 @@ class UNet(BaseModel):
             fuse_lora_weights(unet_model, self.lora_weights, self.lora_scale)
 
             cnet_model_opts = {'torch_dtype': torch.float16} if self.fp16 else {}
-            controlnets = torch.nn.ModuleList([ControlNetModel.from_pretrained(path, **cnet_model_opts).to(self.device) for path in self.controlnet])
+            print("!!! self.controlnet path=", self.controlnet)
+
+            modulelist = []
+            for path in self.controlnet:
+                print('load model args:', cnet_model_opts)
+                if path != 'lllyasviel/sd-controlnet-shulei':
+                    modulelist.append(ControlNetModel.from_pretrained(path, **cnet_model_opts).to(self.device))
+                else:
+                    modulelist.append(ControlNetModel.from_single_file('/localdisk/wangmengbing/epoch-000090.ckpt', dtype=torch.float16).to(self.device))
+            controlnets = torch.nn.ModuleList(modulelist)
+            #controlnets = torch.nn.ModuleList([ControlNetModel.from_pretrained(path, **cnet_model_opts).to(self.device) for path in self.controlnet])
             # FIXME - cache UNet2DConditionControlNetModel
             model = UNet2DConditionControlNetModel(unet_model, controlnets)
         else:
@@ -598,8 +1060,12 @@ class UNet(BaseModel):
             self.get_minmax_dims(batch_size, image_height, image_width, static_batch, static_shape)
         if self.controlnet is None:
             return {
-                'sample': [(2*min_batch, self.unet_dim, min_latent_height, min_latent_width), (2*batch_size, self.unet_dim, latent_height, latent_width), (2*max_batch, self.unet_dim, max_latent_height, max_latent_width)],
-                'encoder_hidden_states': [(2*min_batch, self.text_maxlen, self.embedding_dim), (2*batch_size, self.text_maxlen, self.embedding_dim), (2*max_batch, self.text_maxlen, self.embedding_dim)]
+                'sample': [(2*min_batch, self.unet_dim, min_latent_height, min_latent_width),
+                           (2*batch_size, self.unet_dim, latent_height, latent_width),
+                           (2*max_batch, self.unet_dim, max_latent_height, max_latent_width)],
+                'encoder_hidden_states': [(2*min_batch, self.text_maxlen, self.embedding_dim),
+                                          (2*batch_size, self.text_maxlen, self.embedding_dim),
+                                          (2*max_batch, self.text_maxlen, self.embedding_dim)]
             }
         else:
             return {
@@ -607,7 +1073,7 @@ class UNet(BaseModel):
                            (2*batch_size, self.unet_dim, latent_height, latent_width), 
                            (2*max_batch, self.unet_dim, max_latent_height, max_latent_width)],
                 'encoder_hidden_states': [(2*min_batch, self.text_maxlen, self.embedding_dim), 
-                                          (2*batch_size, self.text_maxlen, self.embedding_dim), 
+                                          (2*batch_size,self.text_maxlen, self.embedding_dim), 
                                           (2*max_batch, self.text_maxlen, self.embedding_dim)],
                 'images': [(len(self.controlnet), 2*min_batch, 3, min_image_height, min_image_width), 
                           (len(self.controlnet), 2*batch_size, 3, image_height, image_width), 
@@ -646,7 +1112,7 @@ class UNet(BaseModel):
                 torch.tensor(999, dtype=torch.float32, device=self.device),
                 torch.randn(batch_size, self.text_maxlen, self.embedding_dim, dtype=dtype, device=self.device),
                 torch.randn(len(self.controlnet), batch_size, 3, image_height, image_width, dtype=dtype, device=self.device),
-                torch.randn(len(self.controlnet), dtype=dtype, device=self.device)
+                torch.randn(len(self.controlnet), dtype=dtype, device=self.device) # controlnet scales
             )
 
 def make_UNet(version, pipeline, hf_token, device, verbose, max_batch_size, controlnet=None, lora_weights=None, lora_scale=1):
